@@ -24,16 +24,16 @@
 //// SecurityManager impl:
 //// Must have all permissions to properly perform access checks
 
-grant codeBase "${codebase.elasticsearch-secure-sm}" {
-  permission java.security.AllPermission;
-};
+//grant codeBase "${codebase.elasticsearch-secure-sm}" {
+//  permission java.security.AllPermission;
+//};
 
 //// Elasticsearch core:
 //// These are only allowed inside the server jar, not in plugins
-grant codeBase "${codebase.elasticsearch}" {
+//grant codeBase "${codebase.elasticsearch}" {
   // needed for loading plugins which may expect the context class loader to be set
-  permission java.lang.RuntimePermission "setContextClassLoader";
-};
+//  permission java.lang.RuntimePermission "setContextClassLoader";
+//};
 
 //// Very special jar permissions:
 //// These are dangerous permissions that we don't want to grant to everything.
@@ -54,10 +54,10 @@ grant codeBase "${codebase.lucene-misc}" {
   permission java.nio.file.LinkPermission "hard";
 };
 
-grant codeBase "${codebase.elasticsearch-plugin-classloader}" {
+//grant codeBase "${codebase.elasticsearch-plugin-classloader}" {
   // needed to create the classloader which allows plugins to extend other plugins
-  permission java.lang.RuntimePermission "createClassLoader";
-};
+//  permission java.lang.RuntimePermission "createClassLoader";
+//};
 
 grant codeBase "${codebase.jna}" {
   // for registering native methods
