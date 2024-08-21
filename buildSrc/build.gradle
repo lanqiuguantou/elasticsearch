@@ -83,7 +83,11 @@ tasks.withType(JavaCompile).configureEach {
  *****************************************************************************/
 
 repositories {
-  jcenter()
+  maven {
+    url 'https://maven.aliyun.com/repository/public/'
+  }
+  mavenLocal()
+  mavenCentral()
 }
 
 dependencies {

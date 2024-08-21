@@ -23,6 +23,9 @@ apply plugin: 'elasticsearch.testclusters'
 testClusters {
   runTask {
     testDistribution = System.getProperty('run.distribution', 'default')
+    numberOfNodes = 3
+    systemProperty 'java.security.policy', '/home/zhangguanhua/project/idea/elasticsearch/run_home/7.10.2/config/elasticsearch.policy'
+    systemProperty 'es.path.plugins', '/home/zhangguanhua/project/idea/elasticsearch/run_home/7.10.2/plugins'
     if (System.getProperty('run.distribution', 'default') == 'default') {
       String licenseType = System.getProperty("run.license_type", "basic")
       if (licenseType == 'trial') {
@@ -33,7 +36,9 @@ testClusters {
       } else if (licenseType != 'basic') {
         throw new IllegalArgumentException("Unsupported self-generated license type: [" + licenseType + "[basic] or [trial].")
       }
-      setting 'xpack.security.enabled', 'true'
+      setting 'xpack.security.enabled', 'false'
+      setting 'discovery.seed_hosts', '127.0.0.1:9300,127.0.0.1:9301,127.0.0.1:9302'
+      setting "indices.breaker.total.use_real_memory", 'true'
       keystore 'bootstrap.password', 'password'
       user username: 'elastic-admin', password: 'elastic-password', role: 'superuser'
     }
