@@ -210,6 +210,23 @@ import static java.util.stream.Collectors.toList;
 /**
  * A node represent a node within a cluster ({@code cluster.name}). The {@link #client()} can be used
  * in order to use a {@link Client} to perform actions/operations against the cluster.
+ *
+ * 【ES 节点核心类 — 所有组件的容器】
+ * Node 是 Elasticsearch 中最核心的类，代表集群中的一个节点。
+ * 它在构造函数中创建所有核心组件（PluginsService、ThreadPool、ClusterService、
+ * IndicesService、TransportService、HttpServerTransport、DiscoveryModule 等），
+ * 在 start() 方法中按严格顺序启动这些组件。
+ *
+ * 生命周期：
+ *   构造函数 → 创建所有组件 → 打印 "initialized"
+ *   start()  → 启动所有服务 → 打印 "starting ..." → "started"
+ *   close()  → 停止所有服务 → 释放资源
+ *
+ * 对应日志：
+ *   [o.e.n.Node] version[7.10.2-SNAPSHOT], pid[547318], build[...]  ← 构造函数开始
+ *   [o.e.n.Node] initialized                                        ← 构造函数结束
+ *   [o.e.n.Node] starting ...                                       ← start() 开始
+ *   [o.e.n.Node] started                                            ← start() 结束
  */
 public class Node implements Closeable {
     public static final Setting<Boolean> WRITE_PORTS_FILE_SETTING =
@@ -290,21 +307,42 @@ public class Node implements Closeable {
     }
 
     /**
-     * Constructs a node
+     * 【Node 构造函数 — 创建所有核心组件】
+     * 这是 ES 启动流程中最重量级的方法，按顺序创建所有核心组件。
+     * 整个构造过程对应日志从 "version[7.10.2-SNAPSHOT]" 到 "initialized"。
      *
-     * @param initialEnvironment         the initial environment for this node, which will be added to by plugins
-     * @param classpathPlugins           the plugins to be loaded from the classpath
-     * @param forbidPrivateIndexSettings whether or not private index settings are forbidden when creating an index; this is used in the
-     *                                   test framework for tests that rely on being able to set private settings
+     * 组件创建顺序（与日志对应）：
+     *   1. 打印版本/JVM/OS 信息 → 日志: version[...], pid[...], build[...]
+     *   2. PluginsService — 加载 modules 和 plugins → 日志: loaded module [aggs-matrix-stats] ...
+     *   3. NodeEnvironment — 数据目录、节点锁 → 日志: using [1] data paths, heap size [512mb]
+     *   4. ThreadPool — 线程池（generic、search、write、management 等）
+     *   5. ClusterService — 集群状态管理（MasterService + ClusterApplierService）
+     *   6. IngestService — 数据预处理管道
+     *   7. ScriptModule / AnalysisModule — 脚本引擎和分词器
+     *   8. SettingsModule — 配置管理（集群级 + 索引级）
+     *   9. ClusterModule / IndicesModule / SearchModule — 集群路由、索引管理、搜索
+     *  10. CircuitBreakerService — 熔断器（防止 OOM）
+     *  11. NetworkModule → Transport + HttpServerTransport → 日志: creating NettyAllocator
+     *  12. DiscoveryModule — 节点发现和选举 → 日志: using discovery type [zen]
+     *  13. RepositoriesModule / SnapshotsService — 快照和恢复
+     *  14. Guice Injector — 依赖注入容器，绑定所有组件
+     *  15. 初始化 REST handlers → 日志: initialized
+     *
+     * @param initialEnvironment         初始环境，会被插件补充额外配置
+     * @param classpathPlugins           从 classpath 加载的插件类（测试用）
+     * @param forbidPrivateIndexSettings 是否禁止私有索引设置（生产环境为 true，测试为 false）
      */
     protected Node(final Environment initialEnvironment,
                    Collection<Class<? extends Plugin>> classpathPlugins, boolean forbidPrivateIndexSettings) {
-        final List<Closeable> resourcesToClose = new ArrayList<>(); // register everything we need to release in the case of an error
+        final List<Closeable> resourcesToClose = new ArrayList<>(); // 错误时需要释放的资源列表
         boolean success = false;
         try {
+            // 合并初始配置，设置 client.type=node
             Settings tmpSettings = Settings.builder().put(initialEnvironment.settings())
                 .put(Client.CLIENT_TYPE_SETTING_S.getKey(), CLIENT_TYPE).build();
 
+            // ==================== 【阶段1：打印节点基本信息】 ====================
+            // 对应日志：[o.e.n.Node] version[7.10.2-SNAPSHOT], pid[547318], build[default/tar/...]
             final JvmInfo jvmInfo = JvmInfo.jvmInfo();
             logger.info(
                 "version[{}], pid[{}], build[{}/{}/{}/{}], OS[{}/{}/{}], JVM[{}/{}/{}/{}]",
@@ -321,6 +359,7 @@ public class Node implements Closeable {
                 Constants.JVM_NAME,
                 Constants.JAVA_VERSION,
                 Constants.JVM_VERSION);
+            // 对应日志：[o.e.n.Node] JVM home [/usr/lib/java/jdk-15.0.2], using bundled JDK [false]
             if (jvmInfo.getBundledJdk()) {
                 logger.info("JVM home [{}], using bundled JDK [{}]", System.getProperty("java.home"), jvmInfo.getUsingBundledJdk());
             } else {
@@ -329,7 +368,9 @@ public class Node implements Closeable {
                     "no-jdk",
                     "no-jdk distributions that do not bundle a JDK are deprecated and will be removed in a future release");
             }
+            // 对应日志：[o.e.n.Node] JVM arguments [-Xshare:auto, -Des.networkaddress.cache.ttl=60, ...]
             logger.info("JVM arguments {}", Arrays.toString(jvmInfo.getInputArguments()));
+            // 对应日志：[o.e.n.Node] version [7.10.2-SNAPSHOT] is a pre-release version ...
             if (Build.CURRENT.isProductionRelease() == false) {
                 logger.warn(
                     "version [{}] is a pre-release version of Elasticsearch and is not suitable for production",
@@ -342,10 +383,17 @@ public class Node implements Closeable {
                     initialEnvironment.logsFile(), initialEnvironment.pluginsFile());
             }
 
+            // ==================== 【阶段2：加载插件和模块】 ====================
+            // 对应日志：[o.e.p.PluginsService] loaded module [aggs-matrix-stats] ... loaded module [x-pack-watcher]
+            //          [o.e.p.PluginsService] no plugins loaded
+            // PluginsService 扫描 modules/ 和 plugins/ 目录，加载所有模块和插件
+            // 模块是 ES 自带的功能扩展（如 reindex、transport-netty4、x-pack-*），插件是用户安装的
             this.pluginsService = new PluginsService(tmpSettings, initialEnvironment.configFile(), initialEnvironment.modulesFile(),
                 initialEnvironment.pluginsFile(), classpathPlugins);
+            // 插件可能会注册额外的配置项，这里获取合并后的最终配置
             final Settings settings = pluginsService.updatedSettings();
 
+            // 收集插件注册的额外节点角色（如 x-pack 注册的 transform、ml 等角色）
             final Set<DiscoveryNodeRole> additionalRoles = pluginsService.filterPlugins(Plugin.class)
                 .stream()
                 .map(Plugin::getRoles)
@@ -353,13 +401,17 @@ public class Node implements Closeable {
                 .collect(Collectors.toSet());
             DiscoveryNode.setAdditionalRoles(additionalRoles);
 
+            // ==================== 【阶段3：创建 NodeEnvironment】 ====================
+            // 对应日志：[o.e.e.NodeEnvironment] using [1] data paths, mounts [[/home (/dev/nvme1n1p6)]]
+            //          [o.e.e.NodeEnvironment] heap size [512mb], compressed ordinary object pointers [true]
+            // NodeEnvironment 管理数据目录、节点锁（防止多个实例使用同一数据目录）、节点 ID
             /*
-             * Create the environment based on the finalized view of the settings. This is to ensure that components get the same setting
-             * values, no matter they ask for them from.
+             * 基于最终配置创建 Environment，确保所有组件获取到一致的配置值
              */
             this.environment = new Environment(settings, initialEnvironment.configFile(), Node.NODE_LOCAL_STORAGE_SETTING.get(settings));
             Environment.assertEquivalent(initialEnvironment, this.environment);
             nodeEnvironment = new NodeEnvironment(tmpSettings, environment);
+            // 对应日志：[o.e.n.Node] node name [runTask-0], node ID [zzXl7znUSLOYhnSt4uutbA], cluster name [runTask], roles [...]
             logger.info("node name [{}], node ID [{}], cluster name [{}], roles {}",
                 NODE_NAME_SETTING.get(tmpSettings), nodeEnvironment.nodeId(), ClusterName.CLUSTER_NAME_SETTING.get(tmpSettings).value(),
                 DiscoveryNode.getRolesFromSettings(settings).stream()
@@ -368,18 +420,24 @@ public class Node implements Closeable {
             resourcesToClose.add(nodeEnvironment);
             localNodeFactory = new LocalNodeFactory(settings, nodeEnvironment.nodeId());
 
+            // ==================== 【阶段4：创建 ThreadPool】 ====================
+            // ThreadPool 是 ES 的线程管理核心，包含多个命名线程池：
+            //   generic（通用）、search（搜索）、write（写入）、management（管理）、
+            //   get（获取）、analyze（分析）、snapshot（快照）等
+            // 插件也可以注册自定义线程池（通过 ExecutorBuilder）
             final List<ExecutorBuilder<?>> executorBuilders = pluginsService.getExecutorBuilders(settings);
 
             final ThreadPool threadPool = new ThreadPool(settings, executorBuilders.toArray(new ExecutorBuilder[0]));
             resourcesToClose.add(() -> ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS));
             final ResourceWatcherService resourceWatcherService = new ResourceWatcherService(settings, threadPool);
             resourcesToClose.add(resourceWatcherService);
-            // adds the context to the DeprecationLogger so that it does not need to be injected everywhere
+            // 将 ThreadContext 注入 DeprecationLogger，使废弃警告能携带请求上下文
             HeaderWarning.setThreadContext(threadPool.getThreadContext());
             resourcesToClose.add(() -> HeaderWarning.removeThreadContext(threadPool.getThreadContext()));
 
+            // ==================== 【阶段5：创建核心服务】 ====================
             final List<Setting<?>> additionalSettings = new ArrayList<>();
-            // register the node.data, node.ingest, node.master, node.remote_cluster_client settings here so we can mark them private
+            // 注册节点角色相关的配置项（node.data、node.ingest、node.master 等）
             additionalSettings.add(NODE_DATA_SETTING);
             additionalSettings.add(NODE_INGEST_SETTING);
             additionalSettings.add(NODE_MASTER_SETTING);
@@ -389,10 +447,13 @@ public class Node implements Closeable {
             for (final ExecutorBuilder<?> builder : threadPool.builders()) {
                 additionalSettings.addAll(builder.getRegisteredSettings());
             }
+            // NodeClient — 节点内部客户端，用于执行集群操作（如索引、搜索、管理等）
             client = new NodeClient(settings, threadPool);
 
+            // ScriptModule — 脚本引擎（Painless、Expression、Mustache）
             final ScriptModule scriptModule = new ScriptModule(settings, pluginsService.filterPlugins(ScriptPlugin.class));
             final ScriptService scriptService = newScriptService(settings, scriptModule.engines, scriptModule.contexts);
+            // AnalysisModule — 分词器和文本分析组件（standard、ik、pinyin 等）
             AnalysisModule analysisModule = new AnalysisModule(this.environment, pluginsService.filterPlugins(AnalysisPlugin.class));
             // this is as early as we can validate settings at this point. we already pass them to ScriptModule as well as ThreadPool
             // so we might be late here already
@@ -403,46 +464,65 @@ public class Node implements Closeable {
                     .flatMap(List::stream)
                     .collect(Collectors.toSet());
 
+            // SettingsModule — 配置管理，区分集群级配置（ClusterSettings）和索引级配置（IndexScopedSettings）
             final SettingsModule settingsModule =
                     new SettingsModule(settings, additionalSettings, additionalSettingsFilter, settingsUpgraders);
             scriptModule.registerClusterSettingsListeners(scriptService, settingsModule.getClusterSettings());
+            // NetworkService — 网络服务，处理自定义 DNS 解析器（由 DiscoveryPlugin 提供）
             final NetworkService networkService = new NetworkService(
                 getCustomNameResolvers(pluginsService.filterPlugins(DiscoveryPlugin.class)));
 
+            // ==================== 【阶段6：创建 ClusterService】 ====================
+            // ClusterService 是集群状态管理的核心，包含：
+            //   - MasterService: 处理集群状态更新任务（仅 master 节点执行）
+            //   - ClusterApplierService: 将集群状态变更应用到本地（所有节点执行）
             List<ClusterPlugin> clusterPlugins = pluginsService.filterPlugins(ClusterPlugin.class);
             final ClusterService clusterService = new ClusterService(settings, settingsModule.getClusterSettings(), threadPool);
-            clusterService.addStateApplier(scriptService);
+            clusterService.addStateApplier(scriptService);  // 脚本服务监听集群状态变更
             resourcesToClose.add(clusterService);
             final Set<Setting<?>> consistentSettings = settingsModule.getConsistentSettings();
             if (consistentSettings.isEmpty() == false) {
                 clusterService.addLocalNodeMasterListener(
                         new ConsistentSettingsService(settings, clusterService, consistentSettings).newHashPublisher());
             }
+            // IngestService — 数据预处理管道（pipeline），支持 grok、geoip、user-agent 等处理器
             final IngestService ingestService = new IngestService(clusterService, threadPool, this.environment,
                 scriptService, analysisModule.getAnalysisRegistry(),
                 pluginsService.filterPlugins(IngestPlugin.class), client);
             final SetOnce<RepositoriesService> repositoriesServiceReference = new SetOnce<>();
+            // ClusterInfoService — 收集集群磁盘使用信息，用于分片分配决策
             final ClusterInfoService clusterInfoService = newClusterInfoService(settings, clusterService, threadPool, client);
+            // UsageService — 统计 REST API 使用情况
             final UsageService usageService = new UsageService();
 
+            // ==================== 【阶段7：构建 Guice 模块】 ====================
+            // ES 使用 Google Guice 作为依赖注入框架，这里按顺序添加各个模块
             ModulesBuilder modules = new ModulesBuilder();
-            // plugin modules must be added here, before others or we can get crazy injection errors...
+            // 插件的 Guice 模块必须最先添加，否则可能出现注入错误
             for (Module pluginModule : pluginsService.createGuiceModules()) {
                 modules.add(pluginModule);
             }
+            // MonitorService — 系统监控（JVM、OS、进程、文件系统）
             final MonitorService monitorService = new MonitorService(settings, nodeEnvironment, threadPool);
+            // FsHealthService — 文件系统健康检查（定期检测数据目录是否可写）
             final FsHealthService fsHealthService = new FsHealthService(settings, clusterService.getClusterSettings(), threadPool,
                 nodeEnvironment);
             final SetOnce<RerouteService> rerouteServiceReference = new SetOnce<>();
             final InternalSnapshotsInfoService snapshotsInfoService = new InternalSnapshotsInfoService(settings, clusterService,
                 repositoriesServiceReference::get, rerouteServiceReference::get);
+            // ClusterModule — 集群路由和分片分配（AllocationService、ShardsAllocator）
             final ClusterModule clusterModule = new ClusterModule(settings, clusterService, clusterPlugins, clusterInfoService,
                 snapshotsInfoService, threadPool.getThreadContext());
             modules.add(clusterModule);
+            // IndicesModule — 索引管理（Mapper 注册、索引操作）
             IndicesModule indicesModule = new IndicesModule(pluginsService.filterPlugins(MapperPlugin.class));
             modules.add(indicesModule);
 
+            // SearchModule — 搜索功能（聚合、查询构建器、排序、高亮、Suggest 等）
             SearchModule searchModule = new SearchModule(settings, false, pluginsService.filterPlugins(SearchPlugin.class));
+            // ==================== 【阶段8：创建熔断器服务】 ====================
+            // CircuitBreakerService — 内存熔断器，防止单个操作耗尽 JVM 堆内存导致 OOM
+            // 包含多个熔断器：fielddata、request、in_flight_requests、accounting 等
             List<BreakerSettings> pluginCircuitBreakers = pluginsService.filterPlugins(CircuitBreakerPlugin.class)
                 .stream()
                 .map(plugin -> plugin.getCircuitBreaker(settings))
@@ -556,12 +636,17 @@ public class Node implements Closeable {
                                                  repositoriesServiceReference::get).stream())
                 .collect(Collectors.toList());
 
+            // ==================== 【阶段9：创建网络层】 ====================
+            // ActionModule — 注册所有 Transport Action 和 REST Action
+            // 每个 REST 端点（如 /_search、/_bulk）都对应一个 RestHandler 和 TransportAction
             ActionModule actionModule = new ActionModule(false, settings, clusterModule.getIndexNameExpressionResolver(),
                 settingsModule.getIndexScopedSettings(), settingsModule.getClusterSettings(), settingsModule.getSettingsFilter(),
                 threadPool, pluginsService.filterPlugins(ActionPlugin.class), client, circuitBreakerService, usageService, systemIndices);
             modules.add(actionModule);
 
             final RestController restController = actionModule.getRestController();
+            // NetworkModule — 网络传输层，创建 Transport（节点间通信，默认 Netty4）和 HttpServerTransport（REST API）
+            // 对应日志：[o.e.t.NettyAllocator] creating NettyAllocator with configs: [name=unpooled, ...]
             final NetworkModule networkModule = new NetworkModule(settings, false, pluginsService.filterPlugins(NetworkPlugin.class),
                 threadPool, bigArrays, pageCacheRecycler, circuitBreakerService, namedWriteableRegistry, xContentRegistry,
                 networkService, restController, clusterService.getClusterSettings());
@@ -576,13 +661,17 @@ public class Node implements Closeable {
                 clusterService.addListener(new SystemIndexMetadataUpgradeService(systemIndices, clusterService));
             }
             new TemplateUpgradeService(client, clusterService, threadPool, indexTemplateMetadataUpgraders);
+            // Transport — 节点间通信的传输层（默认使用 Netty4，端口 9300）
             final Transport transport = networkModule.getTransportSupplier().get();
+            // 收集所有插件注册的 task header（如 X-Opaque-Id，用于请求追踪）
             Set<String> taskHeaders = Stream.concat(
                 pluginsService.filterPlugins(ActionPlugin.class).stream().flatMap(p -> p.getTaskHeaders().stream()),
                 Stream.of(Task.X_OPAQUE_ID)
             ).collect(Collectors.toSet());
+            // TransportService — 封装 Transport，提供请求/响应的高层 API
             final TransportService transportService = newTransportService(settings, transport, threadPool,
                 networkModule.getTransportInterceptor(), localNodeFactory, settingsModule.getClusterSettings(), taskHeaders);
+            // GatewayMetaState — 管理持久化的集群元数据（存储在 Lucene 索引中）
             final GatewayMetaState gatewayMetaState = new GatewayMetaState();
             final ResponseCollectorService responseCollectorService = new ResponseCollectorService(clusterService);
             final SearchTransportService searchTransportService =  new SearchTransportService(transportService,
@@ -609,6 +698,10 @@ public class Node implements Closeable {
                 clusterService.getClusterSettings(), client, threadPool::relativeTimeInMillis, rerouteService);
             clusterInfoService.addListener(diskThresholdMonitor::onNewInfo);
 
+            // ==================== 【阶段10：创建 DiscoveryModule】 ====================
+            // 对应日志：[o.e.d.DiscoveryModule] using discovery type [zen] and seed hosts providers [settings, file]
+            // DiscoveryModule 负责节点发现和 master 选举（Zen2 协议）
+            // 包含 Coordinator（选举协调器）、PeerFinder（节点发现）、LeaderChecker/FollowersChecker（心跳检测）
             final DiscoveryModule discoveryModule = new DiscoveryModule(settings, threadPool, transportService, namedWriteableRegistry,
                 networkService, clusterService.getMasterService(), clusterService.getClusterApplierService(),
                 clusterService.getClusterSettings(), pluginsService.filterPlugins(DiscoveryPlugin.class),
@@ -636,6 +729,9 @@ public class Node implements Closeable {
             resourcesToClose.add(persistentTasksClusterService);
             final PersistentTasksService persistentTasksService = new PersistentTasksService(clusterService, threadPool, client);
 
+            // ==================== 【阶段11：创建 Guice Injector — 依赖注入容器】 ====================
+            // 将所有核心组件绑定到 Guice Injector 中，后续通过 injector.getInstance() 获取
+            // 这是 ES 依赖注入的核心，所有组件的生命周期都由 Injector 管理
             modules.add(b -> {
                     b.bind(Node.class).toInstance(this);
                     b.bind(NodeService.class).toInstance(nodeService);
@@ -700,13 +796,11 @@ public class Node implements Closeable {
                     b.bind(SystemIndices.class).toInstance(systemIndices);
                 }
             );
+            // 创建 Guice Injector 实例，完成所有依赖绑定
             injector = modules.createInjector();
 
-            // We allocate copies of existing shards by looking for a viable copy of the shard in the cluster and assigning the shard there.
-            // The search for viable copies is triggered by an allocation attempt (i.e. a reroute) and is performed asynchronously. When it
-            // completes we trigger another reroute to try the allocation again. This means there is a circular dependency: the allocation
-            // service needs access to the existing shards allocators (e.g. the GatewayAllocator) which need to be able to trigger a
-            // reroute, which needs to call into the allocation service. We close the loop here:
+            // 解决循环依赖：分片分配服务需要 GatewayAllocator，而 GatewayAllocator 需要触发 reroute
+            // 这里通过后置设置来关闭这个循环
             clusterModule.setExistingShardsAllocators(injector.getInstance(GatewayAllocator.class));
 
             List<LifecycleComponent> pluginLifecycleComponents = pluginComponents.stream()
@@ -717,11 +811,17 @@ public class Node implements Closeable {
             resourcesToClose.addAll(pluginLifecycleComponents);
             resourcesToClose.add(injector.getInstance(PeerRecoverySourceService.class));
             this.pluginLifecycleComponents = Collections.unmodifiableList(pluginLifecycleComponents);
+            // 初始化 NodeClient — 将所有 TransportAction 注册到客户端，使其可以执行集群操作
             client.initialize(injector.getInstance(new Key<Map<ActionType, TransportAction>>() {}),
                     () -> clusterService.localNode().getId(), transportService.getRemoteClusterService(),
                     namedWriteableRegistry);
+            // ==================== 【阶段12：初始化 REST handlers】 ====================
+            // 注册所有 REST 端点处理器（如 RestSearchAction、RestIndexAction、RestBulkAction 等）
+            // 每个 REST 端点对应一个 URL 路径和 HTTP 方法（GET/POST/PUT/DELETE）
             logger.debug("initializing HTTP handlers ...");
             actionModule.initRestHandlers(() -> clusterService.state().nodes());
+            // 对应日志：[o.e.n.Node] [runTask-0] initialized
+            // 至此，Node 构造完成，所有组件已创建但尚未启动
             logger.info("initialized");
 
             success = true;
@@ -776,36 +876,74 @@ public class Node implements Closeable {
 
     /**
      * Start the node. If the node is already started, this method is no-op.
+     *
+     * 【启动节点 — 按严格顺序启动所有子服务】
+     * 构造函数只是创建了组件，这里才真正启动它们。启动顺序非常重要，有严格的依赖关系。
+     *
+     * 启动顺序（与日志对应）：
+     *   1. 插件生命周期组件
+     *   2. IndicesService / SnapshotsService / SearchService 等核心服务
+     *   3. GatewayService — 网关恢复服务
+     *   4. TransportService — 节点间传输层 → 日志: publish_address {127.0.0.1:9300}
+     *   5. GatewayMetaState — 加载磁盘上的集群元数据
+     *   6. BootstrapChecks — 执行引导检查（堆大小、文件描述符等）
+     *   7. Discovery.start() + ClusterService.start() — 启动发现和集群服务
+     *   8. discovery.startInitialJoin() — 发起集群加入 → 日志: becoming CANDIDATE
+     *   9. HttpServerTransport — 启动 HTTP 层 → 日志: publish_address {127.0.0.1:9200}
+     *  10. 打印 "started"
+     *
+     * 注意：HTTP 在 Discovery 之后才启动，确保节点在对外提供服务前已开始加入集群。
      */
     public Node start() throws NodeValidationException {
+        // 生命周期状态检查：如果已经启动过，直接返回（幂等）
         if (!lifecycle.moveToStarted()) {
             return this;
         }
 
+        // 对应日志：[o.e.n.Node] [runTask-0] starting ...
         logger.info("starting ...");
+
+        // ==================== 【步骤1：启动插件生命周期组件】 ====================
+        // 启动所有插件创建的 LifecycleComponent（如 x-pack 的 SecurityLifecycleService 等）
         pluginLifecycleComponents.forEach(LifecycleComponent::start);
 
+        // ==================== 【步骤2：启动核心服务】 ====================
         injector.getInstance(MappingUpdatedAction.class).setClient(client);
+        // IndicesService — 索引管理服务（创建/删除/恢复索引）
         injector.getInstance(IndicesService.class).start();
+        // IndicesClusterStateService — 监听集群状态变更，驱动本地索引的创建/删除/恢复
         injector.getInstance(IndicesClusterStateService.class).start();
+        // SnapshotsService — 快照管理（创建/删除快照）
         injector.getInstance(SnapshotsService.class).start();
+        // SnapshotShardsService — 分片级快照操作
         injector.getInstance(SnapshotShardsService.class).start();
+        // RepositoriesService — 快照仓库管理（如 S3、HDFS、共享文件系统）
         injector.getInstance(RepositoriesService.class).start();
+        // SearchService — 搜索服务（处理搜索请求的 query/fetch 阶段）
         injector.getInstance(SearchService.class).start();
+        // FsHealthService — 文件系统健康检查
         injector.getInstance(FsHealthService.class).start();
+        // MonitorService — 系统监控（JVM、OS、进程指标采集）
         nodeService.getMonitorService().start();
 
         final ClusterService clusterService = injector.getInstance(ClusterService.class);
 
+        // NodeConnectionsService — 管理与集群中其他节点的连接
         final NodeConnectionsService nodeConnectionsService = injector.getInstance(NodeConnectionsService.class);
         nodeConnectionsService.start();
         clusterService.setNodeConnectionsService(nodeConnectionsService);
 
+        // ==================== 【步骤3：启动 GatewayService】 ====================
+        // GatewayService — 监听集群状态，当足够多的节点加入后触发索引恢复
+        // 对应日志（master节点）：recovered [0] indices into cluster_state
         injector.getInstance(GatewayService.class).start();
         Discovery discovery = injector.getInstance(Discovery.class);
+        // 将 Discovery 的 publish 方法设置为集群状态发布器
         clusterService.getMasterService().setClusterStatePublisher(discovery::publish);
 
-        // Start the transport service now so the publish address will be added to the local disco node in ClusterService
+        // ==================== 【步骤4：启动 TransportService】 ====================
+        // 对应日志：[o.e.t.TransportService] publish_address {127.0.0.1:9300}, bound_addresses {[::1]:9300}, {127.0.0.1:9300}
+        // 启动传输层后，本节点的 publish address 会被设置到 DiscoveryNode 中
         TransportService transportService = injector.getInstance(TransportService.class);
         transportService.getTaskManager().setTaskResultsService(injector.getInstance(TaskResultsService.class));
         transportService.getTaskManager().setTaskCancellationService(new TaskCancellationService(transportService));
@@ -813,9 +951,12 @@ public class Node implements Closeable {
         assert localNodeFactory.getNode() != null;
         assert transportService.getLocalNode().equals(localNodeFactory.getNode())
             : "transportService has a different local node than the factory provided";
+        // PeerRecoverySourceService — 作为分片恢复的源端，向目标节点发送分片数据
         injector.getInstance(PeerRecoverySourceService.class).start();
 
-        // Load (and maybe upgrade) the metadata stored on disk
+        // ==================== 【步骤5：加载持久化的集群元数据】 ====================
+        // 从磁盘加载（并可能升级）集群元数据，包括索引元数据、集群设置等
+        // 元数据存储在 Lucene 索引中（_state 目录下）
         final GatewayMetaState gatewayMetaState = injector.getInstance(GatewayMetaState.class);
         gatewayMetaState.start(settings(), transportService, clusterService, injector.getInstance(MetaStateService.class),
             injector.getInstance(MetadataIndexUpgradeService.class), injector.getInstance(MetadataUpgrader.class),
@@ -835,25 +976,49 @@ public class Node implements Closeable {
                 assert false : e;
             }
         }
-        // we load the global state here (the persistent part of the cluster state stored on disk) to
-        // pass it to the bootstrap checks to allow plugins to enforce certain preconditions based on the recovered state.
+        // ==================== 【步骤6：执行引导检查（Bootstrap Checks）】 ====================
+        // 加载磁盘上持久化的集群状态元数据，传递给引导检查
+        // 引导检查包括：堆大小检查、文件描述符数量、内存锁定状态、最大线程数、
+        //              虚拟内存限制、系统调用过滤器等
+        // 在生产模式下（绑定非回环地址时），任何检查失败都会阻止节点启动
         final Metadata onDiskMetadata = gatewayMetaState.getPersistedState().getLastAcceptedState().metadata();
         assert onDiskMetadata != null : "metadata is null but shouldn't"; // this is never null
         validateNodeBeforeAcceptingRequests(new BootstrapContext(environment, onDiskMetadata), transportService.boundAddress(),
             pluginsService.filterPlugins(Plugin.class).stream()
                 .flatMap(p -> p.getBootstrapChecks().stream()).collect(Collectors.toList()));
 
+        // ==================== 【步骤7：启动 Discovery 和 ClusterService】 ====================
         clusterService.addStateApplier(transportService.getTaskManager());
-        // start after transport service so the local disco is known
-        discovery.start(); // start before cluster service so that it can set initial state on ClusterApplierService
+        // Discovery 必须在 ClusterService 之前启动，因为它需要在 ClusterApplierService 上设置初始状态
+        discovery.start();
+        // ClusterService 必须在 TransportService 之后启动，因为需要知道本地节点的 DiscoveryNode 信息
         clusterService.start();
         assert clusterService.localNode().equals(localNodeFactory.getNode())
             : "clusterService has a different local node than the factory provided";
+        // 开始接受来自其他节点的传输层请求
         transportService.acceptIncomingRequests();
+
+        // ==================== 【步骤8：发起集群加入（选举流程开始）】 ====================
+        // 对应日志：[o.e.c.c.Coordinator] startInitialJoin: coordinator becoming CANDIDATE in term 0
+        // 这一步触发 Zen2 选举协议：
+        //   1. 节点变为 CANDIDATE 状态
+        //   2. 通过 seed hosts 发现其他节点
+        //   3. 发起 PreVote 预投票
+        //   4. 收集到多数票后发起正式选举（StartJoinRequest）
+        //   5. 赢得选举的节点成为 LEADER（master），其他节点成为 FOLLOWER
+        // 对应日志中的选举过程：
+        //   PreVoteCollector → requesting pre-votes → added PreVoteResponse → starting election
+        //   Coordinator → starting election with StartJoinRequest{term=1}
+        //   最终：runTask-1 赢得选举 → coordinator becoming LEADER in term 2
+        //         runTask-0 成为 follower → coordinator becoming FOLLOWER of [runTask-1]
         discovery.startInitialJoin();
         final TimeValue initialStateTimeout = DiscoverySettings.INITIAL_STATE_TIMEOUT_SETTING.get(settings());
+        // 配置节点和集群 ID 的状态监听器（用于日志中显示集群 UUID）
         configureNodeAndClusterIdStateListener(clusterService);
 
+        // ==================== 【步骤9：等待初始集群状态】 ====================
+        // 如果配置了 discovery.initial_state_timeout（默认 30s），等待 master 选举完成
+        // 如果超时仍未选出 master，节点会打印警告但继续运行
         if (initialStateTimeout.millis() > 0) {
             final ThreadPool thread = injector.getInstance(ThreadPool.class);
             ClusterState clusterState = clusterService.state();
@@ -888,8 +1053,14 @@ public class Node implements Closeable {
             }
         }
 
+        // ==================== 【步骤10：启动 HTTP 服务】 ====================
+        // 对应日志：[o.e.h.AbstractHttpServerTransport] publish_address {127.0.0.1:9200}, bound_addresses {[::1]:9200}, {127.0.0.1:9200}
+        // HTTP 层在 Discovery 之后才启动，这是有意为之——
+        // 确保节点在对外提供 REST API 服务之前，已经开始加入集群流程
         injector.getInstance(HttpServerTransport.class).start();
 
+        // 如果配置了 node.portsfile=true，将传输层和 HTTP 层的端口写入文件
+        // 测试框架用这个来发现节点的端口
         if (WRITE_PORTS_FILE_SETTING.get(settings())) {
             TransportService transport = injector.getInstance(TransportService.class);
             writePortsFile("transport", transport.boundAddress());
@@ -897,8 +1068,12 @@ public class Node implements Closeable {
             writePortsFile("http", http.boundAddress());
         }
 
+        // 对应日志：[o.e.n.Node] [runTask-0] started
+        // 至此，节点启动完成，所有服务已就绪
+        // 后续的集群选举、集群状态同步等操作在后台异步进行
         logger.info("started");
 
+        // 通知所有 ClusterPlugin 节点已启动（插件可以在此执行启动后的初始化逻辑）
         pluginsService.filterPlugins(ClusterPlugin.class).forEach(ClusterPlugin::onNodeStarted);
 
         return this;

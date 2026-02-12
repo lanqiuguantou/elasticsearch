@@ -42,6 +42,12 @@ import java.util.Locale;
 
 /**
  * This class starts elasticsearch.
+ *
+ * 【ES启动入口类】
+ * 这是 Elasticsearch 的 JVM 入口类，继承自 EnvironmentAwareCommand（命令行框架）。
+ * 整体调用链：main() → execute() → init() → Bootstrap.init()
+ * 负责：解析命令行参数(-d/-p/-q/-V)、覆盖DNS缓存策略、安装临时SecurityManager、
+ *       然后将控制权交给 Bootstrap 完成真正的节点初始化和启动。
  */
 class Elasticsearch extends EnvironmentAwareCommand {
 
@@ -71,29 +77,46 @@ class Elasticsearch extends EnvironmentAwareCommand {
 
     /**
      * Main entry point for starting elasticsearch
+     *
+     * 【JVM main 入口 — 启动流程第一步】
+     * 这是整个 Elasticsearch 进程的入口方法，JVM 启动后首先执行这里。
+     * 执行顺序：
+     *   1. overrideDnsCachePolicyProperties() — 覆盖 JVM 的 DNS 缓存策略
+     *      读取 -Des.networkaddress.cache.ttl=60 和 -Des.networkaddress.cache.negative.ttl=10，
+     *      设置到 java.security 属性中，控制 DNS 解析结果的缓存时间。
+     *   2. 安装临时 SecurityManager — 这个 SM 放行所有权限（checkPermission 为空实现），
+     *      目的是让 JVM 内部策略（如 DNS 缓存策略）按"有安全管理器"的路径执行，
+     *      后续在 Bootstrap.setup() 中会替换为真正的、有权限限制的 SecurityManager。
+     *   3. LogConfigurator.registerErrorListener() — 注册日志错误监听器
+     *   4. 创建 Elasticsearch 命令行实例，解析参数并执行 execute() 方法
+     *   5. 如果启动失败（status != OK），打印错误信息并退出
      */
     public static void main(final String[] args) throws Exception {
+        // 【步骤1】覆盖 DNS 缓存策略，确保 ES 能及时感知 DNS 变更
         overrideDnsCachePolicyProperties();
         /*
-         * We want the JVM to think there is a security manager installed so that if internal policy decisions that would be based on the
-         * presence of a security manager or lack thereof act as if there is a security manager present (e.g., DNS cache policy). This
-         * forces such policies to take effect immediately.
+         * 【步骤2】安装临时的全权限 SecurityManager
+         * 我们希望 JVM 认为已经安装了安全管理器，这样 JVM 内部基于安全管理器存在与否的策略决策
+         * （例如 DNS 缓存策略）会按照"有安全管理器"的路径执行。
+         * 这个临时 SM 放行所有权限，后续会在 Bootstrap.setup() 中被替换为正式的 SM。
          */
         System.setSecurityManager(new SecurityManager() {
 
             @Override
             public void checkPermission(Permission perm) {
-                // grant all permissions so that we can later set the security manager to the one that we want
+                // 放行所有权限，以便后续可以设置真正的安全管理器
             }
 
         });
+        // 【步骤3】注册 Log4j2 错误监听器，捕获日志系统自身的错误
         LogConfigurator.registerErrorListener();
+        // 【步骤4】创建命令行实例并执行（会调用 execute() → init() → Bootstrap.init()）
         final Elasticsearch elasticsearch = new Elasticsearch();
         int status = main(args, elasticsearch, Terminal.DEFAULT);
+        // 【步骤5】启动失败时打印错误信息并退出 JVM
         if (status != ExitCodes.OK) {
             final String basePath = System.getProperty("es.logs.base_path");
-            // It's possible to fail before logging has been configured, in which case there's no point
-            // suggesting that the user look in the log file.
+            // 如果日志还没配置好，就没必要提示用户去看日志文件了
             if (basePath != null) {
                 Terminal.DEFAULT.errorPrintln(
                     "ERROR: Elasticsearch did not exit normally - check the logs at "
@@ -106,13 +129,21 @@ class Elasticsearch extends EnvironmentAwareCommand {
         }
     }
 
+    /**
+     * 【覆盖 DNS 缓存策略】
+     * 读取 JVM 系统属性 -Des.networkaddress.cache.ttl 和 -Des.networkaddress.cache.negative.ttl，
+     * 将其设置到 java.security 的对应属性中。
+     * 这样可以控制 JVM 对 DNS 解析结果的正向/负向缓存时间（单位：秒）。
+     * 在日志中可以看到 JVM 参数：-Des.networkaddress.cache.ttl=60, -Des.networkaddress.cache.negative.ttl=10
+     * 即 DNS 正向缓存 60 秒，负向缓存（解析失败）10 秒。
+     */
     private static void overrideDnsCachePolicyProperties() {
         for (final String property : new String[] {"networkaddress.cache.ttl", "networkaddress.cache.negative.ttl" }) {
             final String overrideProperty = "es." + property;
             final String overrideValue = System.getProperty(overrideProperty);
             if (overrideValue != null) {
                 try {
-                    // round-trip the property to an integer and back to a string to ensure that it parses properly
+                    // 先转为整数再转回字符串，确保值是合法的数字
                     Security.setProperty(property, Integer.toString(Integer.valueOf(overrideValue)));
                 } catch (final NumberFormatException e) {
                     throw new IllegalArgumentException(
@@ -126,11 +157,18 @@ class Elasticsearch extends EnvironmentAwareCommand {
         return elasticsearch.main(args, terminal);
     }
 
+    /**
+     * 【命令行执行入口 — 由 EnvironmentAwareCommand 框架回调】
+     * main() 解析完命令行参数后，框架会回调此方法。
+     * 这里处理 -V(版本)、-d(后台运行)、-p(pid文件)、-q(静默模式) 等选项，
+     * 校验临时目录后，调用 init() 进入真正的启动流程。
+     */
     @Override
     protected void execute(Terminal terminal, OptionSet options, Environment env) throws UserException {
         if (options.nonOptionArguments().isEmpty() == false) {
             throw new UserException(ExitCodes.USAGE, "Positional arguments not allowed, found " + options.nonOptionArguments());
         }
+        // 如果指定了 -V/--version，打印版本信息后直接返回，不启动节点
         if (options.has(versionOption)) {
             final String versionOutput = String.format(
                 Locale.ROOT,
@@ -146,17 +184,18 @@ class Elasticsearch extends EnvironmentAwareCommand {
             return;
         }
 
-        final boolean daemonize = options.has(daemonizeOption);
-        final Path pidFile = pidfileOption.value(options);
-        final boolean quiet = options.has(quietOption);
+        final boolean daemonize = options.has(daemonizeOption);  // -d: 是否以守护进程方式运行
+        final Path pidFile = pidfileOption.value(options);       // -p: PID 文件路径
+        final boolean quiet = options.has(quietOption);          // -q: 是否关闭控制台输出
 
-        // a misconfigured java.io.tmpdir can cause hard-to-diagnose problems later, so reject it immediately
+        // 校验 java.io.tmpdir 临时目录是否可用，配置错误会导致后续难以诊断的问题
         try {
             env.validateTmpFile();
         } catch (IOException e) {
             throw new UserException(ExitCodes.CONFIG, e.getMessage());
         }
 
+        // 【关键调用】进入 init() → Bootstrap.init()，开始真正的节点初始化和启动
         try {
             init(daemonize, pidFile, quiet, env);
         } catch (NodeValidationException e) {
@@ -164,13 +203,18 @@ class Elasticsearch extends EnvironmentAwareCommand {
         }
     }
 
+    /**
+     * 【桥接方法 — 连接命令行框架与 Bootstrap】
+     * 将 daemonize 取反为 foreground 参数，调用 Bootstrap.init() 进入核心启动流程。
+     * 如果 Bootstrap 抛出异常，包装为 StartupException 以避免 Guice 等框架产生巨大的堆栈输出。
+     */
     void init(final boolean daemonize, final Path pidFile, final boolean quiet, Environment initialEnv)
         throws NodeValidationException, UserException {
         try {
+            // !daemonize = foreground，即前台运行时 foreground=true
             Bootstrap.init(!daemonize, pidFile, quiet, initialEnv);
         } catch (BootstrapException | RuntimeException e) {
-            // format exceptions to the console in a special way
-            // to avoid 2MB stacktraces from guice, etc.
+            // 格式化异常输出，避免 Guice 等框架产生 2MB 的堆栈信息
             throw new StartupException(e);
         }
     }
